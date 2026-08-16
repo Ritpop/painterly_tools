@@ -52,6 +52,23 @@ class PainterlySettings(bpy.types.PropertyGroup):
         name="Flow Blur", default=1, min=1, max=30,
         description="Smoothness of vector field orientation"
     )
+    use_uv_flow: bpy.props.BoolProperty(
+        name="Use Mesh UV Orientation", default=False,
+        description="Align brush stroke flow direction using active object UV layout directions"
+    )
+    uv_flow_direction: bpy.props.EnumProperty(
+        name="UV Direction Axis",
+        items=[
+            ('U', "U Axis", "Align brush strokes along UV horizontal axis"),
+            ('V', "V Axis", "Align brush strokes along UV vertical axis"),
+            ('TANGENT', "UV Tangent Field", "Align flow field relative to active UV islands")
+        ],
+        default='U'
+    )
+    uv_flow_mix: bpy.props.FloatProperty(
+        name="UV Flow Blend", default=0.7, min=0.0, max=1.0,
+        description="Blend ratio between UV directions and image visual edge gradients"
+    )
     edge_influence: bpy.props.FloatProperty(
         name="Edge Alignment", default=0.5, min=0.0, max=1.0,
         description="Snapping force toward detected image contours"
@@ -97,6 +114,38 @@ class PainterlySettings(bpy.types.PropertyGroup):
     generate_diffuse: bpy.props.BoolProperty(
         name="Export Painterly Color", default=True,
         description="Bake painterly albedo output texture"
+    )
+    generate_cavity: bpy.props.BoolProperty(
+        name="Bake Cavity / Wear Map", default=True,
+        description="Extract curvature crevices and high edge wear"
+    )
+    cavity_source: bpy.props.EnumProperty(
+        name="Cavity Source",
+        items=[
+            ('MESH', "Mesh Geometry", "Calculate 3D curvature directly from active mesh object"),
+            ('TEXTURE', "Texture Bump", "Calculate 2D curvature from baked normal map details")
+        ],
+        default='MESH',
+        description="Source used to compute cavity crevices and edge wear"
+    )
+    cavity_mode: bpy.props.EnumProperty(
+        name="Cavity Target",
+        items=[
+            ('COMBINED', "Combined (Cavity + Edge)", "Dark crevices (<0.5), neutral flat (0.5), bright edges (>0.5)"),
+            ('CAVITY', "Cavity Only (Crevices)", "Dark crevices on clean white background"),
+            ('EDGE', "Edge Wear Only (Ridges)", "Bright highlights on sharp corners and bevels"),
+            ('SPLIT_RG', "RGBA Packed (R: Edge, G: Cavity)", "Red channel = Edge Wear, Green channel = Cavity Occlusion")
+        ],
+        default='COMBINED',
+        description="Type of curvature details to isolate in the output map"
+    )
+    cavity_strength: bpy.props.FloatProperty(
+        name="Cavity Strength", default=1.8, min=0.1, max=5.0,
+        description="Contrast/Depth intensity of extracted cavities and edges"
+    )
+    cavity_blur: bpy.props.IntProperty(
+        name="Cavity Smoothness", default=1, min=0, max=5,
+        description="Smoothing filter radius for cavity details"
     )
     assign_material: bpy.props.BoolProperty(
         name="Apply Material to Active Mesh", default=True,

@@ -27,6 +27,13 @@ def draw_brush(layout, context):
     col.prop(s, "stroke_length")
     col.prop(s, "stroke_curvature")
     col.prop(s, "flow_smoothing")
+    
+    box = col.box()
+    box.prop(s, "use_uv_flow")
+    if s.use_uv_flow:
+        box.prop(s, "uv_flow_direction")
+        box.prop(s, "uv_flow_mix")
+
     col.prop(s, "edge_influence")
     col.prop(s, "edge_blur")
     col.prop(s, "edge_threshold")
@@ -73,10 +80,16 @@ def draw_export(layout, context):
     col = layout.column()
     col.prop(s, "assign_material")
     col.prop(s, "generate_diffuse")
+    col.prop(s, "generate_cavity")
+    if s.generate_cavity:
+        box = col.box()
+        box.prop(s, "cavity_source")
+        box.prop(s, "cavity_mode")
+        box.prop(s, "cavity_strength")
+        box.prop(s, "cavity_blur")
     col.prop(s, "debug_export_textures")
 
 
-# --- View3D Panels ---
 class PAINTERLY_PT_View3D(bpy.types.Panel):
     bl_label = "Painterly PBR"
     bl_idname = "PAINTERLY_PT_view3d"
@@ -89,7 +102,7 @@ class PAINTERLY_PT_View3D(bpy.types.Panel):
 
 
 class PAINTERLY_PT_View3DBrush(bpy.types.Panel):
-    bl_label = "Brush Stroke Settings"
+    bl_label = "Brush Stroke & Flow Settings"
     bl_parent_id = "PAINTERLY_PT_view3d"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'

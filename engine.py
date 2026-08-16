@@ -3,13 +3,17 @@ import gpu
 import numpy as np
 from gpu_extras.batch import batch_for_shader
 from .shaders import get_painterly_shader
-from .image_utils import build_flow_texture_rgba, build_edge_texture_rgba
+from .image_utils import (
+    build_flow_texture_rgba, build_edge_texture_rgba, 
+    generate_uv_flow_angles, build_cavity_texture_rgba,
+    bake_mesh_geometric_cavity, _postprocess_cavity_channels
+)
 
 LAYER_PRESETS = {
     "scale": [2.6, 2.0, 1.2, 0.8, 0.4],
     "opacity": [1.00, 0.65, 0.80, 0.90, 1.00],
     "elongate": [0.0, 1.0, 0.8, 0.4, 0.0],
-    "paints_normal": [False, True, True, True, True],
+    "paints_normal": [True, True, True, True, True],
     "taper": [0.0, 0.3, 0.5, 0.7, 0.9],
     "dry_brush": [0.0, 0.1, 0.2, 0.4, 0.7],
     "wet_blend": [0.6, 0.4, 0.3, 0.1, 0.0]
@@ -18,14 +22,12 @@ LAYER_PRESETS = {
 def _make_gpu_texture(rgba_array, width, height):
     flat = np.ascontiguousarray(rgba_array, dtype=np.float32).ravel()
     expected_size = width * height * 4
-    
     if flat.shape[0] != expected_size:
         flat = np.resize(flat, expected_size)
-        
-    buf = gpu.types.Buffer('FLOAT', expected_size, flat.tolist())
+    buf = gpu.types.Buffer('FLOAT', expected_size, flat)
     return gpu.types.GPUTexture((width, height), format='RGBA32F', data=buf)
 
-def _run_pass(shader, batch, src_tex, flow_tex, edge_tex, prev_tex, width, height,
+def _run_pass(shader, batch, offscreen, src_tex, flow_tex, edge_tex, prev_tex, width, height,
               cell_size, opacity, elongate, density, bristle_detail,
               color_jitter, stroke_tilt, stroke_curvature, normal_strength,
               seed, edge_influence, cell_jitter, paints_normal, output_mode,
@@ -33,10 +35,10 @@ def _run_pass(shader, batch, src_tex, flow_tex, edge_tex, prev_tex, width, heigh
               stroke_taper=0.7, dry_brush=0.3, wet_blend=0.2, 
               facet_hardness=0.1, kuw_radius=2):
 
-    offscreen = gpu.types.GPUOffScreen(width, height, format='RGBA32F')
     with offscreen.bind():
         fb = gpu.state.active_framebuffer_get()
-        fb.clear(color=(0.0, 0.0, 0.0, 0.0) if output_mode == 'DETAIL' else (0.0, 0.0, 0.0, 1.0))
+        clear_col = (0.0, 0.0, 0.0, 0.0) if output_mode == 'DETAIL' else (0.5, 0.5, 1.0, 1.0) if output_mode == 'NORMAL' else (0.0, 0.0, 0.0, 1.0)
+        fb.clear(color=clear_col)
         shader.bind()
         
         shader.uniform_sampler("srcTex", src_tex)
@@ -73,23 +75,33 @@ def _run_pass(shader, batch, src_tex, flow_tex, edge_tex, prev_tex, width, heigh
         buf.dimensions = width * height * 4
         out = np.array(buf, dtype=np.float32).reshape(height, width, 4)
 
-    offscreen.free()
     return out
 
-def execute_painterly_pipeline(img_rgba, settings, input_normal=None, progress_cb=None):
+def execute_painterly_pipeline(img_rgba, settings, active_obj=None, input_normal=None, progress_cb=None):
     H, W = img_rgba.shape[0], img_rgba.shape[1]
+    print(f"\n--- [Painterly Console Debug] Pre-Processing Fields ---")
+
+    uv_angles = None
+    if settings.use_uv_flow and active_obj:
+        uv_angles = generate_uv_flow_angles(active_obj, W, H, settings.uv_flow_direction)
+        print(f"[Painterly Debug] Derived UV Flow Map from object '{active_obj.name}'. Mode: {settings.uv_flow_direction}")
 
     flow_rgba = build_flow_texture_rgba(
         img_rgba, blur_radius=settings.flow_smoothing,
         scale_blend=settings.flow_scale_blend, coarse_multiplier=settings.flow_scale_multiplier,
+        uv_angles=uv_angles, uv_mix=settings.uv_flow_mix
     )
+    print(f"[Painterly Debug] Vector Flow Field built: min={flow_rgba.min():.4f}, max={flow_rgba.max():.4f}, mean={flow_rgba.mean():.4f}")
+
     edge_rgba = build_edge_texture_rgba(
         img_rgba, edge_blur=settings.edge_blur,
         edge_threshold=settings.edge_threshold, edge_contrast=settings.edge_contrast,
     )
+    print(f"[Painterly Debug] Edge Strength Field built: min={edge_rgba.min():.4f}, max={edge_rgba.max():.4f}, mean={edge_rgba.mean():.4f}")
 
     shader = get_painterly_shader()
     batch = batch_for_shader(shader, 'TRIS', {"pos": [(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)]})
+    offscreen = gpu.types.GPUOffScreen(W, H, format='RGBA32F')
 
     src_tex = _make_gpu_texture(img_rgba, W, H)
     flow_tex = _make_gpu_texture(flow_rgba, W, H)
@@ -100,13 +112,19 @@ def execute_painterly_pipeline(img_rgba, settings, input_normal=None, progress_c
 
     if input_normal is not None:
         norm_canvas = input_normal.copy()
+        print(f"[Painterly Debug] Initialized Normal canvas from target_normal image input.")
     else:
         norm_canvas = np.zeros((H, W, 4), dtype=np.float32)
-        norm_canvas[..., 0:3] = [0.5, 0.5, 1.0]
+        norm_canvas[..., 0] = 0.5
+        norm_canvas[..., 1] = 0.5
+        norm_canvas[..., 2] = 1.0
         norm_canvas[..., 3] = 1.0
+        print(f"[Painterly Debug] Initialized Base Flat Normal canvas [0.5, 0.5, 1.0, 1.0].")
 
     total_steps = num_layers * ((1 if settings.generate_diffuse else 0) + 1) + (1 if settings.generate_detail_layer else 0)
     step = 0
+
+    print(f"\n--- [Painterly Console Debug] Executing {num_layers} Painterly Layers ---")
 
     for i in range(num_layers):
         cell_size = max(2.0, min(H, W) * settings.stroke_scale * LAYER_PRESETS["scale"][i])
@@ -121,14 +139,15 @@ def execute_painterly_pipeline(img_rgba, settings, input_normal=None, progress_c
             prev_tex = _make_gpu_texture(diff_canvas, W, H)
             if i == 0 and settings.use_kuwahara_underpaint:
                 diff_canvas = _run_pass(
-                    shader, batch, src_tex, flow_tex, edge_tex, prev_tex, W, H,
+                    shader, batch, offscreen, src_tex, flow_tex, edge_tex, prev_tex, W, H,
                     0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                     settings.random_seed, 0.0, 0.0, False, 'KUWAHARA',
                     kuw_radius=settings.kuw_radius
                 )
+                print(f"[Painterly Debug] Layer {i} [DIFFUSE / Kuwahara]: Output min={diff_canvas.min():.4f}, max={diff_canvas.max():.4f}, mean={diff_canvas.mean():.4f}")
             else:
                 diff_canvas = _run_pass(
-                    shader, batch, src_tex, flow_tex, edge_tex, prev_tex, W, H,
+                    shader, batch, offscreen, src_tex, flow_tex, edge_tex, prev_tex, W, H,
                     cell_size, LAYER_PRESETS["opacity"][i], elong, settings.stroke_density,
                     settings.bristle_detail, settings.color_jitter, settings.stroke_tilt,
                     settings.stroke_curvature, settings.normal_strength,
@@ -137,30 +156,31 @@ def execute_painterly_pipeline(img_rgba, settings, input_normal=None, progress_c
                     stroke_taper=l_taper, dry_brush=l_dry, wet_blend=l_wet,
                     facet_hardness=settings.facet_hardness,
                 )
+                print(f"[Painterly Debug] Layer {i} [DIFFUSE]: Output min={diff_canvas.min():.4f}, max={diff_canvas.max():.4f}, mean={diff_canvas.mean():.4f}")
             step += 1
             if progress_cb: progress_cb(step / total_steps)
 
-        if not (i == 0 and settings.use_kuwahara_underpaint):
-            prev_norm_tex = _make_gpu_texture(norm_canvas, W, H)
-            norm_canvas = _run_pass(
-                shader, batch, src_tex, flow_tex, edge_tex, prev_norm_tex, W, H,
-                cell_size, LAYER_PRESETS["opacity"][i], elong, settings.stroke_density,
-                settings.bristle_detail, settings.color_jitter, settings.stroke_tilt,
-                settings.stroke_curvature, settings.normal_strength,
-                settings.random_seed + i * 97, settings.edge_influence,
-                settings.cell_jitter, paints_norm, 'NORMAL',
-                stroke_taper=l_taper, dry_brush=l_dry, wet_blend=l_wet,
-                facet_hardness=settings.facet_hardness,
-            )
-            step += 1
-            if progress_cb: progress_cb(step / total_steps)
+        prev_norm_tex = _make_gpu_texture(norm_canvas, W, H)
+        norm_canvas = _run_pass(
+            shader, batch, offscreen, src_tex, flow_tex, edge_tex, prev_norm_tex, W, H,
+            cell_size, LAYER_PRESETS["opacity"][i], elong, settings.stroke_density,
+            settings.bristle_detail, settings.color_jitter, settings.stroke_tilt,
+            settings.stroke_curvature, settings.normal_strength,
+            settings.random_seed + i * 97, settings.edge_influence,
+            settings.cell_jitter, paints_norm, 'NORMAL',
+            stroke_taper=l_taper, dry_brush=l_dry, wet_blend=l_wet,
+            facet_hardness=settings.facet_hardness,
+        )
+        print(f"[Painterly Debug] Layer {i} [NORMAL]: Output min={norm_canvas.min():.4f}, max={norm_canvas.max():.4f}, mean={norm_canvas.mean():.4f}")
+        step += 1
+        if progress_cb: progress_cb(step / total_steps)
 
     detail_rgba = None
     if settings.generate_detail_layer:
         detail_cell_size = max(2.0, min(H, W) * settings.detail_scale)
         transparent_tex = _make_gpu_texture(np.zeros((H, W, 4), dtype=np.float32), W, H)
         detail_rgba = _run_pass(
-            shader, batch, src_tex, flow_tex, edge_tex, transparent_tex, W, H,
+            shader, batch, offscreen, src_tex, flow_tex, edge_tex, transparent_tex, W, H,
             detail_cell_size, settings.detail_opacity, 1.0, settings.detail_density,
             settings.bristle_detail, settings.color_jitter, settings.stroke_tilt,
             settings.stroke_curvature, settings.normal_strength,
@@ -171,20 +191,42 @@ def execute_painterly_pipeline(img_rgba, settings, input_normal=None, progress_c
             stroke_taper=1.0, dry_brush=0.8, wet_blend=0.0,
             facet_hardness=settings.facet_hardness,
         )
+        print(f"[Painterly Debug] Detail Lineart Pass: Output min={detail_rgba.min():.4f}, max={detail_rgba.max():.4f}, mean={detail_rgba.mean():.4f}")
         step += 1
         if progress_cb: progress_cb(step / total_steps)
 
-    nx, ny, nz = norm_canvas[..., 0] * 2.0 - 1.0, norm_canvas[..., 1] * 2.0 - 1.0, norm_canvas[..., 2] * 2.0 - 1.0
+    offscreen.free()
+
+    nx = norm_canvas[..., 0] * 2.0 - 1.0
+    ny = norm_canvas[..., 1] * 2.0 - 1.0
+    nz = norm_canvas[..., 2] * 2.0 - 1.0
     length = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2)
     length = np.where(length < 1e-6, 1.0, length)
+
     norm_canvas[..., 0] = (nx / length) * 0.5 + 0.5
     norm_canvas[..., 1] = (ny / length) * 0.5 + 0.5
     norm_canvas[..., 2] = (nz / length) * 0.5 + 0.5
     norm_canvas[..., 3] = 1.0
+    print(f"[Painterly Debug] Normal Canvas Normalized: min={norm_canvas.min():.4f}, max={norm_canvas.max():.4f}, mean={norm_canvas.mean():.4f}")
+
+    cavity_rgba = None
+    if settings.generate_cavity:
+        if settings.cavity_source == 'MESH' and active_obj:
+            cavity_rgba = bake_mesh_geometric_cavity(
+                active_obj, W, H, strength=settings.cavity_strength, blur_radius=settings.cavity_blur, mode=settings.cavity_mode
+            )
+            print(f"[Painterly Debug] Baked 3D Mesh Geometric Cavity Map for object '{active_obj.name}'. Mode: {settings.cavity_mode}")
+
+        if cavity_rgba is None:
+            raw_cav = build_cavity_texture_rgba(norm_canvas, strength=settings.cavity_strength, blur_radius=settings.cavity_blur)
+            cavity_rgba = _postprocess_cavity_channels(raw_cav, mode=settings.cavity_mode)
+            print(f"[Painterly Debug] Computed 2D Texture Bump Cavity Map. Mode: {settings.cavity_mode}")
+
+        print(f"[Painterly Debug] Cavity Map Final Stats: min={cavity_rgba.min():.4f}, max={cavity_rgba.max():.4f}, mean={cavity_rgba.mean():.4f}")
 
     diff_canvas[..., 3] = img_rgba[..., 3]
 
-    return diff_canvas, norm_canvas, detail_rgba, flow_rgba, edge_rgba
+    return diff_canvas, norm_canvas, detail_rgba, cavity_rgba, flow_rgba, edge_rgba
 
 def build_staircase_node_group():
     grp_name = "Smooth Staircase Quantizer"
@@ -253,7 +295,7 @@ def _create_color_mix_node(nodes, blend_type='MULTIPLY', factor=1.0):
         mix.inputs['Fac'].default_value = factor
         return mix, mix.inputs['Color1'], mix.inputs['Color2'], mix.outputs['Color']
 
-def apply_toon_material(obj, diff_img, norm_img, scene=None):
+def apply_toon_material(obj, diff_img, norm_img, cavity_img=None, cavity_mode='COMBINED', scene=None):
     if not obj or obj.type != 'MESH':
         return
 
@@ -280,7 +322,56 @@ def apply_toon_material(obj, diff_img, norm_img, scene=None):
 
     tex_diff = nodes.new('ShaderNodeTexImage')
     tex_diff.image = diff_img
-    tex_diff.location = (400, 300)
+    tex_diff.location = (-400, 300)
+
+    col_socket = tex_diff.outputs[0]
+
+    if cavity_img:
+        tex_cav = nodes.new('ShaderNodeTexImage')
+        tex_cav.image = cavity_img
+        tex_cav.image.colorspace_settings.name = 'Non-Color'
+        tex_cav.location = (-400, 600)
+
+        if cavity_mode == 'SPLIT_RG':
+            sep_cav = nodes.new('ShaderNodeSeparateColor')
+            sep_cav.location = (-150, 600)
+            links.new(tex_cav.outputs[0], sep_cav.inputs[0])
+
+            inv_node = nodes.new('ShaderNodeInvert')
+            inv_node.location = (50, 600)
+            if hasattr(inv_node.inputs, 'Color'):
+                links.new(sep_cav.outputs[1], inv_node.inputs['Color'])
+            else:
+                links.new(sep_cav.outputs[1], inv_node.inputs[1])
+
+            mix_cav, c_in_a, c_in_b, c_out = _create_color_mix_node(nodes, blend_type='MULTIPLY', factor=1.0)
+            mix_cav.location = (250, 450)
+            links.new(col_socket, c_in_a)
+            if hasattr(inv_node.outputs, 'Color'):
+                links.new(inv_node.outputs['Color'], c_in_b)
+            else:
+                links.new(inv_node.outputs[0], c_in_b)
+            col_socket = c_out
+
+            mix_edge, e_in_a, e_in_b, e_out = _create_color_mix_node(nodes, blend_type='ADD', factor=0.5)
+            mix_edge.location = (450, 450)
+            links.new(col_socket, e_in_a)
+            links.new(sep_cav.outputs[0], e_in_b)
+            col_socket = e_out
+
+        elif cavity_mode == 'EDGE':
+            mix_edge, e_in_a, e_in_b, e_out = _create_color_mix_node(nodes, blend_type='ADD', factor=0.5)
+            mix_edge.location = (100, 450)
+            links.new(col_socket, e_in_a)
+            links.new(tex_cav.outputs[0], e_in_b)
+            col_socket = e_out
+
+        else:
+            mix_cav, c_in_a, c_in_b, c_out = _create_color_mix_node(nodes, blend_type='MULTIPLY', factor=0.8)
+            mix_cav.location = (100, 450)
+            links.new(col_socket, c_in_a)
+            links.new(tex_cav.outputs[0], c_in_b)
+            col_socket = c_out
 
     if is_cycles:
         toon = nodes.new('ShaderNodeBsdfToon')
@@ -289,7 +380,7 @@ def apply_toon_material(obj, diff_img, norm_img, scene=None):
         toon.inputs[2].default_value = 0.40
         toon.location = (1000, 0)
 
-        links.new(tex_diff.outputs[0], toon.inputs[0])
+        links.new(col_socket, toon.inputs[0])
         links.new(norm_map.outputs[0], toon.inputs[3])
         links.new(toon.outputs[0], out_node.inputs[0])
     else:
@@ -321,14 +412,14 @@ def apply_toon_material(obj, diff_img, norm_img, scene=None):
         mix_mult, mult_in_a, mult_in_b, mult_out = _create_color_mix_node(nodes, blend_type='MULTIPLY', factor=1.0)
         mix_mult.location = (600, 0)
 
-        links.new(tex_diff.outputs[0], mult_in_a)
+        links.new(col_socket, mult_in_a)
         links.new(comb_hsv.outputs[0], mult_in_b)
 
         mix_over, over_in_a, over_in_b, over_out = _create_color_mix_node(nodes, blend_type='OVERLAY', factor=0.3)
         mix_over.location = (800, 0)
 
         links.new(mult_out, over_in_a)
-        links.new(tex_diff.outputs[0], over_in_b)
+        links.new(col_socket, over_in_b)
 
         emit = nodes.new('ShaderNodeEmission')
         emit.location = (1100, 0)

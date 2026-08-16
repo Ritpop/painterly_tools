@@ -215,7 +215,38 @@ void main() {
 }
 """
 
+MESH_CAVITY_VERT = """
+void main() {
+    v_bary = bary;
+    v_edge_cavity = edge_cavity;
+    gl_Position = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+MESH_CAVITY_FRAG = """
+void main() {
+    vec3 d = fwidth(v_bary);
+    vec3 a3 = smoothstep(vec3(0.0), d * (1.5 + strength * 2.0), v_bary);
+    
+    float edgeMask = 1.0 - min(min(a3.x, a3.y), a3.z);
+    
+    float targetCavity = 0.5;
+    if (a3.z <= a3.x && a3.z <= a3.y) {
+        targetCavity = v_edge_cavity.x;
+    } else if (a3.x <= a3.y) {
+        targetCavity = v_edge_cavity.y;
+    } else {
+        targetCavity = v_edge_cavity.z;
+    }
+
+    float c = mix(0.5, targetCavity, edgeMask);
+    c = clamp(c, 0.0, 1.0);
+    fragColor = vec4(c, c, c, 1.0);
+}
+"""
+
 _shader_cache = None
+_mesh_cavity_shader_cache = None
 
 def get_painterly_shader():
     global _shader_cache
@@ -230,6 +261,7 @@ def get_painterly_shader():
     info.sampler(1, 'FLOAT_2D', "flowTex")
     info.sampler(2, 'FLOAT_2D', "prevTex")
     info.sampler(3, 'FLOAT_2D', "edgeTex")
+    
     info.push_constant('FLOAT', "edgeInfluence")
     info.push_constant('VEC2', "resolution")
     info.push_constant('FLOAT', "cellSize")
@@ -252,6 +284,7 @@ def get_painterly_shader():
     info.push_constant('FLOAT', "edgeDensityThreshold")
     info.push_constant('INT', "paintsNormal")
     info.push_constant('INT', "outputMode")
+
     info.vertex_in(0, 'VEC2', "pos")
     info.vertex_out(vert_out)
     info.fragment_out(0, 'VEC4', "fragColor")
@@ -260,3 +293,25 @@ def get_painterly_shader():
 
     _shader_cache = gpu.shader.create_from_info(info)
     return _shader_cache
+
+def get_mesh_cavity_shader():
+    global _mesh_cavity_shader_cache
+    if _mesh_cavity_shader_cache is not None:
+        return _mesh_cavity_shader_cache
+
+    vert_out = gpu.types.GPUStageInterfaceInfo("mesh_cavity_iface")
+    vert_out.smooth('VEC3', "v_bary")
+    vert_out.smooth('VEC3', "v_edge_cavity")
+
+    info = gpu.types.GPUShaderCreateInfo()
+    info.push_constant('FLOAT', "strength")
+    info.vertex_in(0, 'VEC3', "bary")
+    info.vertex_in(1, 'VEC3', "edge_cavity")
+    info.vertex_in(2, 'VEC2', "uv")
+    info.vertex_out(vert_out)
+    info.fragment_out(0, 'VEC4', "fragColor")
+    info.vertex_source(MESH_CAVITY_VERT)
+    info.fragment_source(MESH_CAVITY_FRAG)
+
+    _mesh_cavity_shader_cache = gpu.shader.create_from_info(info)
+    return _mesh_cavity_shader_cache
